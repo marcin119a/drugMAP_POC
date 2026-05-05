@@ -38,6 +38,19 @@ class Decoder(nn.Module):
         return self.net(z)
 
 
+class DrugEncoder(nn.Module):
+    def __init__(self, fp_dim: int, drug_emb_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(fp_dim, fp_dim // 4),
+            nn.ReLU(),
+            nn.Linear(fp_dim // 4, drug_emb_dim),
+        )
+
+    def forward(self, fp: torch.Tensor) -> torch.Tensor:
+        return self.net(fp)
+
+
 class DrugResponseHead(nn.Module):
     def __init__(self, latent_dim: int, drug_emb_dim: int, hidden_dim: int):
         super().__init__()
@@ -57,13 +70,13 @@ class DrugMAPVAE(nn.Module):
         input_dim: int,
         hidden_dim: int,
         latent_dim: int,
-        n_drugs: int,
         drug_emb_dim: int,
+        fp_dim: int = 2048,
     ):
         super().__init__()
         self.encoder = Encoder(input_dim, hidden_dim, latent_dim)
         self.decoder = Decoder(latent_dim, hidden_dim, input_dim)
-        self.drug_embedding = nn.Embedding(n_drugs, drug_emb_dim)
+        self.drug_encoder = DrugEncoder(fp_dim, drug_emb_dim)
         self.drug_head = DrugResponseHead(latent_dim, drug_emb_dim, hidden_dim // 4)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -72,10 +85,10 @@ class DrugMAPVAE(nn.Module):
             return mu + std * torch.randn_like(std)
         return mu
 
-    def forward(self, x: torch.Tensor, drug_idx: torch.Tensor):
+    def forward(self, x: torch.Tensor, drug_fp: torch.Tensor):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
         recon = self.decoder(z)
-        drug_emb = self.drug_embedding(drug_idx)
+        drug_emb = self.drug_encoder(drug_fp)
         ic50_pred = self.drug_head(z, drug_emb)
         return recon, mu, logvar, z, ic50_pred

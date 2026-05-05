@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 
 import numpy as np
@@ -6,7 +7,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
 
-from dataset import DrugDataset, build_drug2idx
+from dataset import DrugDataset, build_drug2idx, build_drug_fingerprints
 from losses import compute_loss
 from model import DrugMAPVAE
 
@@ -17,16 +18,25 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
 
 
+def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
+    """Average LN_IC50 for duplicate (CELL_LINE_NAME, DRUG_NAME) pairs."""
+    ic50_mean = df.groupby(["CELL_LINE_NAME", "DRUG_NAME"])["LN_IC50"].mean()
+    deduped = df.drop_duplicates(subset=["CELL_LINE_NAME", "DRUG_NAME"]).copy()
+    deduped = deduped.set_index(["CELL_LINE_NAME", "DRUG_NAME"])
+    deduped["LN_IC50"] = ic50_mean
+    return deduped.reset_index()
+
+
 def train_epoch(model, loader, optimizer, device, w_kl, w_ic50, w_mmd):
     model.train()
     totals = {"recon": 0, "kl": 0, "ic50": 0, "mmd": 0, "total": 0}
     n = 0
 
-    for x, drug_idx, ic50, domain in loader:
-        x, drug_idx, ic50 = x.to(device), drug_idx.to(device), ic50.to(device)
+    for x, drug_fp, ic50, domain in loader:
+        x, drug_fp, ic50 = x.to(device), drug_fp.to(device), ic50.to(device)
         domain = domain.to(device)
 
-        recon, mu, logvar, z, ic50_pred = model(x, drug_idx)
+        recon, mu, logvar, z, ic50_pred = model(x, drug_fp)
 
         mask_cell = domain == 0
         z_cell = z[mask_cell]
@@ -58,11 +68,11 @@ def eval_epoch(model, loader, device, w_kl, w_ic50, w_mmd):
     totals = {"recon": 0, "kl": 0, "ic50": 0, "mmd": 0, "total": 0}
     n = 0
 
-    for x, drug_idx, ic50, domain in loader:
-        x, drug_idx, ic50 = x.to(device), drug_idx.to(device), ic50.to(device)
+    for x, drug_fp, ic50, domain in loader:
+        x, drug_fp, ic50 = x.to(device), drug_fp.to(device), ic50.to(device)
         domain = domain.to(device)
 
-        recon, mu, logvar, z, ic50_pred = model(x, drug_idx)
+        recon, mu, logvar, z, ic50_pred = model(x, drug_fp)
 
         mask_cell = domain == 0
         z_cell = z[mask_cell]
@@ -87,6 +97,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ccle", default="data/ccle_filtered_merged_df.parquet")
     parser.add_argument("--patient", default="data/filtered_merged_df.parquet")
+    parser.add_argument("--smiles", default="data/drug_smiles.csv")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--hidden_dim", type=int, default=512)
@@ -97,7 +108,7 @@ def main():
     parser.add_argument("--w_ic50", type=float, default=1.0)
     parser.add_argument("--w_mmd", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--val_frac", type=float, default=0.1)
+    parser.add_argument("--val_frac", type=float, default=0.2)
     parser.add_argument("--save", default="checkpoints/drugmap.pt")
     args = parser.parse_args()
 
@@ -105,50 +116,63 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    ccle_df = pd.read_parquet(args.ccle)
-    patient_df = pd.read_parquet(args.patient)
+    ccle_df = deduplicate(pd.read_parquet(args.ccle))
+    patient_df = deduplicate(pd.read_parquet(args.patient))
     drug2idx = build_drug2idx(ccle_df, patient_df)
-    n_drugs = len(drug2idx)
+    drug_names = [d for d, _ in sorted(drug2idx.items(), key=lambda x: x[1])]
 
     rna_sample = ccle_df["TPM"].iloc[0]
     mut_sample = ccle_df["mutation"].iloc[0]
     input_dim = len(rna_sample) + len(mut_sample)
     print(f"Input dim: {input_dim}  (RNA: {len(rna_sample)}, mutations: {len(mut_sample)})")
-    print(f"Drugs: {n_drugs}")
+    print(f"Drugs: {len(drug2idx)}")
 
-    def split(df, frac):
-        idx = np.random.permutation(len(df))
-        cut = int(len(df) * frac)
-        return df.iloc[idx[cut:]], df.iloc[idx[:cut]]
+    if not os.path.exists(args.smiles):
+        raise FileNotFoundError(
+            f"{args.smiles} not found — run: python scripts/fetch_smiles.py"
+        )
+    drug_fps = build_drug_fingerprints(args.smiles, drug_names)
+    print(f"Drug fingerprints: {drug_fps.shape}")
 
-    ccle_train, ccle_val = split(ccle_df, args.val_frac)
-    pat_train, pat_val = split(patient_df, args.val_frac)
+    def split_by_cell_line(df, val_cells):
+        mask = df["CELL_LINE_NAME"].isin(val_cells)
+        return df[~mask].reset_index(drop=True), df[mask].reset_index(drop=True)
+
+    all_cell_lines = np.array(sorted(ccle_df["CELL_LINE_NAME"].unique()))
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(all_cell_lines)
+    cut = int(len(all_cell_lines) * args.val_frac)
+    val_cells = set(all_cell_lines[:cut])
+    print(f"Cell lines: {len(all_cell_lines)} total, {cut} val, {len(all_cell_lines)-cut} train")
+
+    ccle_train, ccle_val = split_by_cell_line(ccle_df, val_cells)
+    pat_train, pat_val = split_by_cell_line(patient_df, val_cells)
 
     train_set = ConcatDataset([
-        DrugDataset(ccle_train.reset_index(drop=True), drug2idx, domain=0),
-        DrugDataset(pat_train.reset_index(drop=True), drug2idx, domain=1),
+        DrugDataset(ccle_train, drug2idx, drug_fps, domain=0),
+        DrugDataset(pat_train, drug2idx, drug_fps, domain=1),
     ])
     val_set = ConcatDataset([
-        DrugDataset(ccle_val.reset_index(drop=True), drug2idx, domain=0),
-        DrugDataset(pat_val.reset_index(drop=True), drug2idx, domain=1),
+        DrugDataset(ccle_val, drug2idx, drug_fps, domain=0),
+        DrugDataset(pat_val, drug2idx, drug_fps, domain=1),
     ])
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    pin = device.type == "cuda"
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=pin)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin)
 
     model = DrugMAPVAE(
         input_dim=input_dim,
         hidden_dim=args.hidden_dim,
         latent_dim=args.latent_dim,
-        n_drugs=n_drugs,
         drug_emb_dim=args.drug_emb_dim,
+        fp_dim=drug_fps.shape[1],
     ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    import os
     os.makedirs(os.path.dirname(args.save), exist_ok=True)
 
     best_val = float("inf")
