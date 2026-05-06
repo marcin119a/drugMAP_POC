@@ -39,13 +39,41 @@ def build_drug2idx(ccle_df: pd.DataFrame, patient_df: pd.DataFrame) -> dict:
     return {d: i for i, d in enumerate(drugs)}
 
 
+def build_cancer2idx(ccle_df: pd.DataFrame, patient_df: pd.DataFrame) -> dict:
+    cancers = sorted(set(ccle_df["primary_disease"]) | set(patient_df["primary_disease"]))
+    return {c: i for i, c in enumerate(cancers)}
+
+
+def build_target2idx(ccle_df: pd.DataFrame) -> dict:
+    targets = sorted(ccle_df["PUTATIVE_TARGET"].dropna().unique())
+    return {"UNK": 0, **{t: i + 1 for i, t in enumerate(targets)}}
+
+
+def build_pathway2idx(ccle_df: pd.DataFrame) -> dict:
+    pathways = sorted(ccle_df["PATHWAY_NAME"].dropna().unique())
+    return {"UNK": 0, **{p: i + 1 for i, p in enumerate(pathways)}}
+
+
+def build_drug2target(ccle_df: pd.DataFrame, target2idx: dict) -> dict:
+    rows = ccle_df[["DRUG_NAME", "PUTATIVE_TARGET"]].drop_duplicates("DRUG_NAME")
+    return {r["DRUG_NAME"]: target2idx.get(r["PUTATIVE_TARGET"], 0) for _, r in rows.iterrows()}
+
+
+def build_drug2pathway(ccle_df: pd.DataFrame, pathway2idx: dict) -> dict:
+    rows = ccle_df[["DRUG_NAME", "PATHWAY_NAME"]].drop_duplicates("DRUG_NAME")
+    return {r["DRUG_NAME"]: pathway2idx.get(r["PATHWAY_NAME"], 0) for _, r in rows.iterrows()}
+
+
 class DrugDataset(Dataset):
     """
     domain=0 → cell lines (CCLE), ic50 used in loss
     domain=1 → patients, ic50 ignored in loss
+    cancer_label → primary_disease integer index, used for contrastive loss
     """
 
-    def __init__(self, df: pd.DataFrame, drug2idx: dict, drug_fps: np.ndarray, domain: int):
+    def __init__(self, df: pd.DataFrame, drug2idx: dict, drug_fps: np.ndarray,
+                 domain: int, cancer2idx: dict,
+                 drug2target: dict, drug2pathway: dict):
         self.domain = domain
         rna_col = "TPM"
         mut_col = "mutation" if "mutation" in df.columns else "symbol_counts"
@@ -57,10 +85,22 @@ class DrugDataset(Dataset):
         idx = np.array([drug2idx[d] for d in df["DRUG_NAME"]])
         self.drug_fp = torch.from_numpy(drug_fps[idx])
 
+        self.target_idx = torch.tensor(
+            [drug2target.get(d, 0) for d in df["DRUG_NAME"]], dtype=torch.long
+        )
+        self.pathway_idx = torch.tensor(
+            [drug2pathway.get(d, 0) for d in df["DRUG_NAME"]], dtype=torch.long
+        )
+
         self.ic50 = torch.tensor(df["LN_IC50"].values, dtype=torch.float32)
+        self.cancer_label = torch.tensor(
+            [cancer2idx[c] for c in df["primary_disease"]], dtype=torch.long
+        )
 
     def __len__(self):
         return len(self.ic50)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.drug_fp[idx], self.ic50[idx], self.domain
+        return (self.features[idx], self.drug_fp[idx],
+                self.target_idx[idx], self.pathway_idx[idx],
+                self.ic50[idx], self.domain, self.cancer_label[idx])

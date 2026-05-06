@@ -3,15 +3,17 @@ import torch.nn as nn
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(dropout),
         )
         self.mu_head = nn.Linear(hidden_dim // 2, latent_dim)
         self.logvar_head = nn.Linear(hidden_dim // 2, latent_dim)
@@ -22,15 +24,17 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim: int, hidden_dim: int, output_dim: int):
+    def __init__(self, latent_dim: int, hidden_dim: int, output_dim: int, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim),
         )
 
@@ -39,16 +43,23 @@ class Decoder(nn.Module):
 
 
 class DrugEncoder(nn.Module):
-    def __init__(self, fp_dim: int, drug_emb_dim: int):
+    def __init__(self, fp_dim: int, drug_emb_dim: int,
+                 n_targets: int, n_pathways: int,
+                 target_emb_dim: int = 32, pathway_emb_dim: int = 16):
         super().__init__()
+        self.target_emb = nn.Embedding(n_targets, target_emb_dim)
+        self.pathway_emb = nn.Embedding(n_pathways, pathway_emb_dim)
+        in_dim = fp_dim + target_emb_dim + pathway_emb_dim
         self.net = nn.Sequential(
-            nn.Linear(fp_dim, fp_dim // 4),
+            nn.Linear(in_dim, in_dim // 4),
             nn.ReLU(),
-            nn.Linear(fp_dim // 4, drug_emb_dim),
+            nn.Linear(in_dim // 4, drug_emb_dim),
         )
 
-    def forward(self, fp: torch.Tensor) -> torch.Tensor:
-        return self.net(fp)
+    def forward(self, fp: torch.Tensor, target_idx: torch.Tensor, pathway_idx: torch.Tensor) -> torch.Tensor:
+        t = self.target_emb(target_idx)
+        p = self.pathway_emb(pathway_idx)
+        return self.net(torch.cat([fp, t, p], dim=-1))
 
 
 class DrugResponseHead(nn.Module):
@@ -71,12 +82,19 @@ class DrugMAPVAE(nn.Module):
         hidden_dim: int,
         latent_dim: int,
         drug_emb_dim: int,
+        n_targets: int,
+        n_pathways: int,
         fp_dim: int = 2048,
+        target_emb_dim: int = 32,
+        pathway_emb_dim: int = 16,
+        dropout: float = 0.2,
     ):
         super().__init__()
-        self.encoder = Encoder(input_dim, hidden_dim, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_dim, input_dim)
-        self.drug_encoder = DrugEncoder(fp_dim, drug_emb_dim)
+        self.encoder = Encoder(input_dim, hidden_dim, latent_dim, dropout)
+        self.decoder = Decoder(latent_dim, hidden_dim, input_dim, dropout)
+        self.drug_encoder = DrugEncoder(
+            fp_dim, drug_emb_dim, n_targets, n_pathways, target_emb_dim, pathway_emb_dim
+        )
         self.drug_head = DrugResponseHead(latent_dim, drug_emb_dim, hidden_dim // 4)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -85,10 +103,11 @@ class DrugMAPVAE(nn.Module):
             return mu + std * torch.randn_like(std)
         return mu
 
-    def forward(self, x: torch.Tensor, drug_fp: torch.Tensor):
+    def forward(self, x: torch.Tensor, drug_fp: torch.Tensor,
+                target_idx: torch.Tensor, pathway_idx: torch.Tensor):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
         recon = self.decoder(z)
-        drug_emb = self.drug_encoder(drug_fp)
+        drug_emb = self.drug_encoder(drug_fp, target_idx, pathway_idx)
         ic50_pred = self.drug_head(z, drug_emb)
         return recon, mu, logvar, z, ic50_pred
