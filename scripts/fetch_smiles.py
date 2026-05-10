@@ -31,13 +31,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ccle", default="data/ccle_filtered_merged_df.parquet")
     parser.add_argument("--patient", default="data/filtered_merged_df.parquet")
+    parser.add_argument("--train", default=None,
+                        help="primary_site_train.parquet (data_projects pipeline); "
+                             "when set, --ccle and --patient are ignored")
     parser.add_argument("--out", default="data/drug_smiles.csv")
     parser.add_argument("--delay", type=float, default=0.03, help="seconds between PubChem requests")
     args = parser.parse_args()
 
-    ccle_df = pd.read_parquet(args.ccle)
-    pat_df = pd.read_parquet(args.patient)
-    drugs = sorted(set(ccle_df["DRUG_NAME"]) | set(pat_df["DRUG_NAME"]))
+    if args.train is not None:
+        train_df = pd.read_parquet(args.train)
+        drugs = sorted(train_df["DRUG_NAME"].unique())
+    else:
+        ccle_df = pd.read_parquet(args.ccle)
+        pat_df = pd.read_parquet(args.patient)
+        drugs = sorted(set(ccle_df["DRUG_NAME"]) | set(pat_df["DRUG_NAME"]))
     print(f"Fetching SMILES for {len(drugs)} drugs from PubChem...")
 
     results = []

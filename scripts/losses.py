@@ -2,10 +2,6 @@ import torch
 import torch.nn.functional as F
 
 
-def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-
 def supervised_contrastive_loss(
     z: torch.Tensor,
     labels: torch.Tensor,
@@ -44,20 +40,16 @@ def supervised_contrastive_loss(
 def compute_loss(
     recon: torch.Tensor,
     x: torch.Tensor,
-    mu: torch.Tensor,
-    logvar: torch.Tensor,
     ic50_pred: torch.Tensor,
     ic50_true: torch.Tensor,
     z: torch.Tensor,
     cancer_labels: torch.Tensor,
     mask_cell: torch.Tensor,
-    w_kl: float = 1e-3,
     w_ic50: float = 1.0,
     w_contrastive: float = 1.0,
     temperature: float = 0.07,
 ):
     loss_recon = F.mse_loss(recon, x)
-    loss_kl = kl_divergence(mu, logvar)
 
     loss_ic50 = torch.tensor(0.0, device=x.device)
     if mask_cell.any():
@@ -65,10 +57,9 @@ def compute_loss(
 
     loss_contrastive = supervised_contrastive_loss(z, cancer_labels, temperature)
 
-    total = loss_recon + w_kl * loss_kl + w_ic50 * loss_ic50 + w_contrastive * loss_contrastive
+    total = loss_recon + w_ic50 * loss_ic50 + w_contrastive * loss_contrastive
     return total, {
         "recon": loss_recon.item(),
-        "kl": loss_kl.item(),
         "ic50": loss_ic50.item(),
         "contrastive": loss_contrastive.item(),
     }
