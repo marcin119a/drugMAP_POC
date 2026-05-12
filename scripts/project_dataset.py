@@ -30,6 +30,15 @@ def build_dicts(train_df: pd.DataFrame) -> tuple[dict, dict, dict, dict, dict, d
     return drug2idx, cancer2idx, target2idx, pathway2idx, drug2target, drug2pathway
 
 
+def _extract_features(df: pd.DataFrame) -> np.ndarray:
+    """Stack rna+mutation vectors into a contiguous float32 matrix and free intermediates."""
+    rna = np.stack(df["rna_vector"].values).astype(np.float32)
+    mut = np.stack(df["mutation_vector"].values).astype(np.float32)
+    out = np.concatenate([rna, mut], axis=1)
+    del rna, mut
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------------
@@ -38,6 +47,9 @@ class ProjectCellLineDataset(Dataset):
     """
     Cell-line drug response dataset from primary_site_train.parquet.
     domain=0 → IC50 loss is active.
+
+    Stores features as numpy arrays; torch tensors are created per-sample in
+    __getitem__ via zero-copy from_numpy, avoiding a doubled in-memory footprint.
     """
 
     def __init__(
@@ -49,36 +61,28 @@ class ProjectCellLineDataset(Dataset):
         drug2target: dict,
         drug2pathway: dict,
     ):
-        rna = np.stack(df["rna_vector"].values).astype(np.float32)
-        mut = np.stack(df["mutation_vector"].values).astype(np.float32)
-        self.features = torch.from_numpy(np.concatenate([rna, mut], axis=1))
+        self.features = _extract_features(df)
 
         d_idx = np.array([drug2idx[d] for d in df["DRUG_NAME"]])
-        self.drug_fp = torch.from_numpy(drug_fps[d_idx])
+        self.drug_fp = drug_fps[d_idx]  # view into shared fp matrix
 
-        self.target_idx = torch.tensor(
-            [drug2target.get(d, 0) for d in df["DRUG_NAME"]], dtype=torch.long
-        )
-        self.pathway_idx = torch.tensor(
-            [drug2pathway.get(d, 0) for d in df["DRUG_NAME"]], dtype=torch.long
-        )
-        self.ic50 = torch.tensor(df["LN_IC50"].values, dtype=torch.float32)
-        self.cancer_label = torch.tensor(
-            [cancer2idx.get(c, 0) for c in df["primary_site"]], dtype=torch.long
-        )
+        self.target_idx = np.array([drug2target.get(d, 0) for d in df["DRUG_NAME"]], dtype=np.int64)
+        self.pathway_idx = np.array([drug2pathway.get(d, 0) for d in df["DRUG_NAME"]], dtype=np.int64)
+        self.ic50 = df["LN_IC50"].values.astype(np.float32)
+        self.cancer_label = np.array([cancer2idx.get(c, 0) for c in df["primary_site"]], dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.ic50)
 
     def __getitem__(self, idx):
         return (
-            self.features[idx],
-            self.drug_fp[idx],
-            self.target_idx[idx],
-            self.pathway_idx[idx],
-            self.ic50[idx],
+            torch.from_numpy(self.features[idx].copy()),
+            torch.from_numpy(self.drug_fp[idx].copy()),
+            int(self.target_idx[idx]),
+            int(self.pathway_idx[idx]),
+            float(self.ic50[idx]),
             0,  # domain — cell line
-            self.cancer_label[idx],
+            int(self.cancer_label[idx]),
         )
 
 
@@ -86,8 +90,9 @@ class ProjectTCGADataset(Dataset):
     """
     Patient dataset from primary_site_tcga.parquet.
     domain=1 → IC50 loss is masked out in training.
-    Each patient is paired with `drugs_per_patient` randomly sampled drugs
-    from the cell-line training set for contrastive learning.
+
+    Patient features are stored once (N_patients × dim). Drug pairings are stored
+    as index arrays, so each feature vector is NOT duplicated drugs_per_patient times.
     """
 
     def __init__(
@@ -101,45 +106,50 @@ class ProjectTCGADataset(Dataset):
         drugs_per_patient: int = 5,
         seed: int = 42,
     ):
-        rna = np.stack(df["rna_vector"].values).astype(np.float32)
-        mut = np.stack(df["mutation_vector"].values).astype(np.float32)
-        patient_features = np.concatenate([rna, mut], axis=1)
+        self.patient_features = _extract_features(df)  # (N_patients, dim) — stored once
+        self.drug_fps = drug_fps  # shared reference, not copied
 
         all_drugs = sorted(drug2idx.keys())
+        n_drugs = len(all_drugs)
+        k = min(drugs_per_patient, n_drugs)
+        n_patients = len(df)
+
         rng = np.random.default_rng(seed)
+        # Shape: (n_patients, k) — indices into all_drugs list
+        sampled_slots = np.array([
+            rng.choice(n_drugs, size=k, replace=False)
+            for _ in range(n_patients)
+        ])
 
-        feat_rows, fp_rows, target_rows, pathway_rows, cancer_rows = [], [], [], [], []
+        all_drug_names = np.array(all_drugs)
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            sampled = rng.choice(all_drugs, size=min(drugs_per_patient, len(all_drugs)), replace=False)
-            cancer_id = cancer2idx.get(row["primary_site"], 0)
-            for d in sampled:
-                feat_rows.append(patient_features[i])
-                fp_rows.append(drug_fps[drug2idx[d]])
-                target_rows.append(drug2target.get(d, 0))
-                pathway_rows.append(drug2pathway.get(d, 0))
-                cancer_rows.append(cancer_id)
+        # Flat index arrays — one entry per (patient, drug) pair
+        self.patient_idx = np.repeat(np.arange(n_patients), k)
+        sampled_drug_names = all_drug_names[sampled_slots.flatten()]
 
-        self.features = torch.from_numpy(np.stack(feat_rows))
-        self.drug_fp = torch.from_numpy(np.stack(fp_rows))
-        self.target_idx = torch.tensor(target_rows, dtype=torch.long)
-        self.pathway_idx = torch.tensor(pathway_rows, dtype=torch.long)
-        self.cancer_label = torch.tensor(cancer_rows, dtype=torch.long)
-        # IC50 placeholder — ignored by loss when domain=1
-        self.ic50 = torch.zeros(len(feat_rows), dtype=torch.float32)
+        self.drug_fp_idx = np.array([drug2idx[d] for d in sampled_drug_names], dtype=np.int64)
+        self.target_idx = np.array([drug2target.get(d, 0) for d in sampled_drug_names], dtype=np.int64)
+        self.pathway_idx = np.array([drug2pathway.get(d, 0) for d in sampled_drug_names], dtype=np.int64)
+
+        cancer_per_patient = np.array(
+            [cancer2idx.get(row["primary_site"], 0) for _, row in df.iterrows()], dtype=np.int64
+        )
+        self.cancer_label = cancer_per_patient[self.patient_idx]
 
     def __len__(self) -> int:
-        return len(self.ic50)
+        return len(self.patient_idx)
 
     def __getitem__(self, idx):
+        p = self.patient_idx[idx]
+        d = self.drug_fp_idx[idx]
         return (
-            self.features[idx],
-            self.drug_fp[idx],
-            self.target_idx[idx],
-            self.pathway_idx[idx],
-            self.ic50[idx],
-            1,  # domain — patient
-            self.cancer_label[idx],
+            torch.from_numpy(self.patient_features[p].copy()),
+            torch.from_numpy(self.drug_fps[d].copy()),
+            int(self.target_idx[idx]),
+            int(self.pathway_idx[idx]),
+            0.0,  # IC50 placeholder — ignored by loss when domain=1
+            1,    # domain — patient
+            int(self.cancer_label[idx]),
         )
 
 
@@ -193,11 +203,22 @@ def build_project_loaders(
     cl_train = train_df[~train_df["CELL_LINE_NAME"].isin(val_cells)].reset_index(drop=True)
     cl_val = train_df[train_df["CELL_LINE_NAME"].isin(val_cells)].reset_index(drop=True)
 
+    # Measure dims before dropping columns
+    sample_rna = train_df["rna_vector"].iloc[0]
+    sample_mut = train_df["mutation_vector"].iloc[0]
+    input_dim = len(sample_rna) + len(sample_mut)
+
+    # Free the large object-dtype columns from both full dataframes — the subsets
+    # (cl_train / cl_val) will still carry them until the Datasets are constructed.
+    del train_df, tcga_df
+
+    tcga_df = pd.read_parquet(data_dir / "primary_site_tcga.parquet")
     tcga_idx = np.arange(len(tcga_df))
     rng.shuffle(tcga_idx)
     tcga_cut = int(len(tcga_df) * val_frac)
     tcga_train = tcga_df.iloc[tcga_idx[tcga_cut:]].reset_index(drop=True)
     tcga_val = tcga_df.iloc[tcga_idx[:tcga_cut]].reset_index(drop=True)
+    del tcga_df
 
     ds_kwargs = dict(
         drug_fps=drug_fps, drug2idx=drug2idx, cancer2idx=cancer2idx,
@@ -208,18 +229,23 @@ def build_project_loaders(
         ProjectCellLineDataset(cl_train, **ds_kwargs),
         ProjectTCGADataset(tcga_train, **ds_kwargs, drugs_per_patient=drugs_per_patient, seed=seed),
     ])
+    del cl_train, tcga_train
+
     val_set = ConcatDataset([
         ProjectCellLineDataset(cl_val, **ds_kwargs),
         ProjectTCGADataset(tcga_val, **ds_kwargs, drugs_per_patient=drugs_per_patient, seed=seed),
     ])
+    del cl_val, tcga_val
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin)
 
-    sample_rna = train_df["rna_vector"].iloc[0]
-    sample_mut = train_df["mutation_vector"].iloc[0]
-    input_dim = len(sample_rna) + len(sample_mut)
+    n_cell_lines = len(all_cell_lines)
+    print(f"[data] Cell lines: {n_cell_lines} ({n_cell_lines - cut} train / {cut} val)")
+    print(f"[data] Train samples: {len(train_set)}  Val samples: {len(val_set)}")
+    print(f"[data] Drugs: {len(drug2idx)}  Cancer types: {len(cancer2idx)}")
+    print(f"[data] Input dim: {input_dim}  FP dim: {FP_BITS}")
 
     meta = dict(
         input_dim=input_dim,
@@ -232,11 +258,4 @@ def build_project_loaders(
         pathway2idx=pathway2idx,
     )
 
-    print(f"[data] Cell lines: {len(all_cell_lines)} ({len(all_cell_lines)-cut} train / {cut} val)")
-    print(f"[data] TCGA patients: {len(tcga_df)} ({len(tcga_train)} train / {len(tcga_val)} val)")
-    print(f"[data] Train samples: {len(train_set)}  Val samples: {len(val_set)}")
-    print(f"[data] Drugs: {len(drug2idx)}  Cancer types: {len(cancer2idx)}")
-    print(f"[data] Input dim: {input_dim}  FP dim: {FP_BITS}")
-
     return train_loader, val_loader, meta
-
