@@ -78,7 +78,7 @@ class DrugDataset(Dataset):
         rna_col = "TPM"
         mut_col = "mutation" if "mutation" in df.columns else "symbol_counts"
 
-        rna = np.stack(df[rna_col].values).astype(np.float32)
+        rna = np.nan_to_num(np.stack(df[rna_col].values).astype(np.float32), nan=0.0)
         mut = np.stack(df[mut_col].values).astype(np.float32)
         self.features = torch.from_numpy(np.concatenate([rna, mut], axis=1))
 

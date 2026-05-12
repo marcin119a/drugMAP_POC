@@ -32,7 +32,7 @@ def build_dicts(train_df: pd.DataFrame) -> tuple[dict, dict, dict, dict, dict, d
 
 def _extract_features(df: pd.DataFrame) -> np.ndarray:
     """Stack rna+mutation vectors into a contiguous float32 matrix and free intermediates."""
-    rna = np.stack(df["rna_vector"].values).astype(np.float32)
+    rna = np.nan_to_num(np.stack(df["rna_vector"].values).astype(np.float32), nan=0.0)
     mut = np.stack(df["mutation_vector"].values).astype(np.float32)
     out = np.concatenate([rna, mut], axis=1)
     del rna, mut
@@ -68,7 +68,7 @@ class ProjectCellLineDataset(Dataset):
 
         self.target_idx = np.array([drug2target.get(d, 0) for d in df["DRUG_NAME"]], dtype=np.int64)
         self.pathway_idx = np.array([drug2pathway.get(d, 0) for d in df["DRUG_NAME"]], dtype=np.int64)
-        self.ic50 = df["LN_IC50"].values.astype(np.float32)
+        self.ic50 = torch.from_numpy(df["LN_IC50"].values.astype(np.float32))
         self.cancer_label = np.array([cancer2idx.get(c, 0) for c in df["primary_site"]], dtype=np.int64)
 
     def __len__(self) -> int:
@@ -80,7 +80,7 @@ class ProjectCellLineDataset(Dataset):
             torch.from_numpy(self.drug_fp[idx].copy()),
             int(self.target_idx[idx]),
             int(self.pathway_idx[idx]),
-            float(self.ic50[idx]),
+            self.ic50[idx],
             0,  # domain — cell line
             int(self.cancer_label[idx]),
         )
@@ -147,7 +147,7 @@ class ProjectTCGADataset(Dataset):
             torch.from_numpy(self.drug_fps[d].copy()),
             int(self.target_idx[idx]),
             int(self.pathway_idx[idx]),
-            0.0,  # IC50 placeholder — ignored by loss when domain=1
+            torch.tensor(0., dtype=torch.float32),  # IC50 placeholder — ignored by loss when domain=1
             1,    # domain — patient
             int(self.cancer_label[idx]),
         )
@@ -206,7 +206,9 @@ def build_project_loaders(
     # Measure dims before dropping columns
     sample_rna = train_df["rna_vector"].iloc[0]
     sample_mut = train_df["mutation_vector"].iloc[0]
-    input_dim = len(sample_rna) + len(sample_mut)
+    rna_dim = len(sample_rna)
+    mut_dim = len(sample_mut)
+    input_dim = rna_dim + mut_dim
 
     # Free the large object-dtype columns from both full dataframes — the subsets
     # (cl_train / cl_val) will still carry them until the Datasets are constructed.
@@ -249,6 +251,8 @@ def build_project_loaders(
 
     meta = dict(
         input_dim=input_dim,
+        rna_dim=rna_dim,
+        mut_dim=mut_dim,
         fp_dim=FP_BITS,
         n_targets=len(target2idx),
         n_pathways=len(pathway2idx),

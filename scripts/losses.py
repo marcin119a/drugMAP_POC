@@ -45,8 +45,10 @@ def compute_loss(
     z: torch.Tensor,
     cancer_labels: torch.Tensor,
     mask_cell: torch.Tensor,
+    aux_loss: torch.Tensor,
     w_ic50: float = 1.0,
     w_contrastive: float = 1.0,
+    w_aux: float = 0.01,
     temperature: float = 0.07,
 ):
     loss_recon = F.mse_loss(recon, x)
@@ -57,9 +59,10 @@ def compute_loss(
 
     loss_contrastive = supervised_contrastive_loss(z, cancer_labels, temperature)
 
-    total = loss_recon + w_ic50 * loss_ic50 + w_contrastive * loss_contrastive
+    total = loss_recon + w_ic50 * loss_ic50 + w_contrastive * loss_contrastive + w_aux * aux_loss
     return total, {
         "recon": loss_recon.item(),
         "ic50": loss_ic50.item(),
         "contrastive": loss_contrastive.item(),
+        "aux": aux_loss.item(),
     }
